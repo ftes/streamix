@@ -100,6 +100,9 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 - The release turns off BEAM scheduler busy-waiting (`+sbwt none +sbwtdcpu none +sbwtdio none`, overridable via
   `ELIXIR_ERL_OPTIONS`): on the shared VPS an idle node spent ~10% of a core spinning.
+- The postgres image moves to TimescaleDB 2.32.1-pg17 and rabbitmq to 4.4.1-management-alpine in both compose files.
+  Production only picks them up when an operator recreates those services by hand; the TimescaleDB recreate needs
+  `ALTER EXTENSION timescaledb UPDATE;` before restarting the app.
 - The qdrant image moves to v1.20.2 and the postgres image to TimescaleDB 2.32.0-pg17 in both compose files.
   Production only picks them up when an operator recreates the `qdrant`/`postgres` services by hand; a TimescaleDB
   recreate needs `ALTER EXTENSION timescaledb UPDATE;` before restarting the app.
@@ -236,6 +239,8 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Security
 
+- Dependency updates fix three more advisories: `phoenix` 1.8.17 (EEF-CVE-2026-129344, EEF-CVE-2026-128361) and
+  `db_connection` 2.10.3 (EEF-CVE-2026-133555).
 - Dependency updates fix three advisories: `phoenix_live_view` 1.2.14 (EEF-CVE-2026-126334), `plug` 1.20.4
   (EEF-CVE-2026-120287) and `idna` 8.0.0 (EEF-CVE-2026-117678), with `swoosh` 1.30.0 allowing the new idna.
 - Watch history, playback progress and favorites are sealed per user: AES-256-GCM rows under a random library key
@@ -263,6 +268,18 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Semantic search and "similar titles" work again: NVIDIA retired `nvidia/nemotron-3-embed-1b` on 2026-11-23 (410
+  Gone), which stopped the nightly embedding index. The default model is now `nvidia/nemotron-3.5-embed-1b` (same
+  2048-dimension vectors); the next `IndexEmbeddingsWorker` run re-embeds every title. The new model screens its
+  input and refuses a whole request when one text trips the filter; such a title is now isolated and left out of the
+  index instead of discarding the run. A 5xx from NVIDIA (the endpoint answers some requests with "service inference
+  failed") is retried with backoff, four times while indexing and once for a search query.
+- Semantic search no longer answers with titles that left the index. Indexing only ever added and updated Qdrant
+  points, so titles removed from the catalog, from an inactive provider or (for anime) reclassified kept matching
+  with vectors from a retired model; a whole-catalog run now deletes those points after each collection.
+- Semantic similarity floors are re-measured for `nemotron-3.5-embed-1b`: text queries 0.40 (was 0.25), similar
+  titles 0.50 (was 0.40), profile recommendations 0.45 (was 0.35). Off-topic searches such as "receita de bolo"
+  no longer return titles that only share a word.
 - Xtream providers fail over across all registered domains for sync, health, metadata, EPG and playback, and
   prefer the fastest live domain; a dead domain no longer stalls requests for ~23 s or caps live viewing at one
   stream.

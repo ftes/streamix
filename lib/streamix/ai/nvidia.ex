@@ -11,7 +11,7 @@ defmodule Streamix.AI.Nvidia do
 
   Set the following environment variables:
   - `NVIDIA_API_KEY` - Your NVIDIA NIM API key
-  - `NVIDIA_EMBEDDING_MODEL` - Model to use (default: nv-embedqa-e5-v5)
+  - `NVIDIA_EMBEDDING_MODEL` - Model to use (default: nvidia/nemotron-3.5-embed-1b)
 
   ## Rate Limits
 
@@ -33,6 +33,14 @@ defmodule Streamix.AI.Nvidia do
   @base_url "https://integrate.api.nvidia.com/v1"
   @max_rate_limit_retries 5
 
+  # 2026-11-25: the hosted nemotron-3.5 endpoint answers a share of requests
+  # with 500 "service inference failed", for any input (the same text fails
+  # and then succeeds a second later). Without a retry, one such answer failed
+  # a whole indexing batch and three of them discarded the nightly reindex.
+  # Indexing can afford to wait; a search query is on a person's request path,
+  # so it gets one quick retry only.
+  @server_error_retries %{"passage" => 4, "query" => 1}
+
   # 2026-08-25: NVIDIA retired a whole generation of embedding models on one
   # day — nv-embedqa-e5-v5, llama-3.2-nv-embedqa-1b-v2 and baai/bge-m3 all
   # answer 410 Gone. Semantic search had been degraded since, silently: the
@@ -42,7 +50,12 @@ defmodule Streamix.AI.Nvidia do
   #
   # The default has to be a model that is actually alive, otherwise a fresh
   # deployment is broken before it starts.
-  @default_model "nvidia/nemotron-3-embed-1b"
+  #
+  # 2026-11-23: nemotron-3-embed-1b reached end of life too (410). Its
+  # successor keeps the 2048-dimension vectors, so the Qdrant collections stay
+  # as they are, but vectors from two models are not comparable: the index has
+  # to be rebuilt (the daily IndexEmbeddingsWorker re-embeds every title).
+  @default_model "nvidia/nemotron-3.5-embed-1b"
 
   # Dimensions are a property of the model, so they have to travel with it.
   # Leaving them as a constant while NVIDIA_EMBEDDING_MODEL was configurable
@@ -50,6 +63,8 @@ defmodule Streamix.AI.Nvidia do
   # dimension count is precisely the failure SearchHealth documents it cannot
   # detect. Unknown models fall back to NVIDIA_EMBEDDING_DIMENSIONS.
   @model_dimensions %{
+    "nvidia/nemotron-3.5-embed-1b" => 2048,
+    "nvidia/nemotron-3.5-embed-8b" => 4096,
     "nvidia/nemotron-3-embed-1b" => 2048,
     "nvidia/llama-nemotron-embed-vl-1b-v2" => 2048,
     "nvidia/nv-embedqa-e5-v5" => 1024,
@@ -166,7 +181,7 @@ defmodule Streamix.AI.Nvidia do
 
   # Private functions
 
-  defp do_embed_batch(texts, input_type, rate_limit_attempt \\ 0) do
+  defp do_embed_batch(texts, input_type, rate_limit_attempt \\ 0, server_error_attempt \\ 0) do
     url = "#{@base_url}/embeddings"
 
     body =
@@ -184,7 +199,15 @@ defmodule Streamix.AI.Nvidia do
       {"Accept", "application/json"}
     ]
 
-    case Req.post(url, body: body, headers: headers, receive_timeout: 30_000, retry: false) do
+    request_options =
+      Keyword.merge(
+        [body: body, headers: headers, receive_timeout: 30_000, retry: false],
+        Application.get_env(:streamix, :nvidia, [])[:req_options] || []
+      )
+
+    max_server_error_retries = Map.get(@server_error_retries, to_string(input_type), 1)
+
+    case Req.post(url, request_options) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         embeddings =
           body["data"]
@@ -197,10 +220,17 @@ defmodule Streamix.AI.Nvidia do
         delay = 2_000 * Integer.pow(2, rate_limit_attempt)
         Logger.warning("[NVIDIA] Rate limited, retrying in #{delay}ms")
         Process.sleep(delay)
-        do_embed_batch(texts, input_type, rate_limit_attempt + 1)
+        do_embed_batch(texts, input_type, rate_limit_attempt + 1, server_error_attempt)
 
       {:ok, %Req.Response{status: 429}} ->
         {:error, :rate_limit_retries_exhausted}
+
+      {:ok, %Req.Response{status: status}}
+      when status in 500..599 and server_error_attempt < max_server_error_retries ->
+        delay = server_error_backoff() * Integer.pow(2, server_error_attempt)
+        Logger.warning("[NVIDIA] Server error, retrying", reason: status)
+        Process.sleep(delay)
+        do_embed_batch(texts, input_type, rate_limit_attempt, server_error_attempt + 1)
 
       {:ok, %Req.Response{status: status, body: body}} ->
         Logger.error("[NVIDIA] API error #{status}: #{inspect(body)}")
@@ -212,12 +242,18 @@ defmodule Streamix.AI.Nvidia do
     end
   end
 
+  defp server_error_backoff do
+    Application.get_env(:streamix, :nvidia, [])[:server_error_backoff_ms] || 1_000
+  end
+
   defp api_key do
     Application.get_env(:streamix, :nvidia, [])[:api_key] ||
       System.get_env("NVIDIA_API_KEY")
   end
 
-  defp model do
+  @doc "The embedding model requests go to: the configured one, else the default."
+  @spec model() :: String.t()
+  def model do
     Application.get_env(:streamix, :nvidia, [])[:embedding_model] ||
       System.get_env("NVIDIA_EMBEDDING_MODEL") ||
       @default_model
